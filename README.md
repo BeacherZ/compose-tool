@@ -1,5 +1,7 @@
 # Compose Tool 🐳
 
+<p align="center"><a href="README_EN.md">English</a> ｜ 简体中文</p>
+
 **Docker Compose 配置转换工具**
 
 一键转换 Docker Run 命令和 Docker Compose 配置，实现"一容器一目录"的标准化管理。
