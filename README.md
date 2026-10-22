@@ -5,6 +5,7 @@
 一键转换 Docker Run 命令和 Docker Compose 配置，实现"一容器一目录"的标准化管理。
 
 ![License](https://img.shields.io/github/license/BeacherZ/compose-tool?style=flat-square)
+![Version](https://img.shields.io/badge/version-1.0.0-blue?style=flat-square)
 ![Docker](https://img.shields.io/badge/docker-ready-blue?style=flat-square&logo=docker)
 ![GitHub Stars](https://img.shields.io/github/stars/BeacherZ/compose-tool?style=flat-square)
 
@@ -70,6 +71,13 @@
 
 ## 🚀 快速部署
 
+镜像 `ghcr.io/beacherz/compose-tool`，同时提供 `linux/amd64` 与 `linux/arm64`，下面是**当前发行版 1.0.0**。
+
+| 镜像标签 | 说明 |
+|---|---|
+| `latest` | 跟随 main 分支，升级默认用它 |
+| `1.0.0` / `1.0` | 发行版标签，需要锁版本时用 |
+
 ### 方式一：Docker Run（不推荐）
 
 ```bash
@@ -78,8 +86,17 @@ docker run -d \
   --restart unless-stopped \
   -p 6688:80 \
   -e VOLUME_PREFIX=/opt/docker/{container_name} \
-  ghcr.io/beacherz/compose-tool:latest
+  ghcr.io/beacherz/compose-tool:latest   # 想锁版本就换成 :1.0.0
 ```
+
+**升级**：先拉新镜像、删掉旧容器，再把上面那条 `docker run` 原样粘一次（纯静态页面没有数据卷，删容器不丢东西）：
+
+```bash
+docker pull ghcr.io/beacherz/compose-tool:latest
+docker rm -f compose-tool
+```
+
+> 锁了版本号的话，把上面命令里的标签都换成目标版本（如 `1.0.1`）再执行一遍。
 
 ### 方式二：Docker Compose（推荐，符合本工具理念）
 > 💡 自定义路径说明：
@@ -89,7 +106,7 @@ mkdir -p /opt/docker/compose-tool && cd /opt/docker/compose-tool && \
 cat > compose.yaml << 'EOF'
 services:
   compose-tool:
-    image: ghcr.io/beacherz/compose-tool:latest
+    image: ghcr.io/beacherz/compose-tool:latest  # 想锁版本改成 1.0.0
     container_name: compose-tool
     restart: unless-stopped
     ports:
@@ -99,6 +116,13 @@ services:
       - VOLUME_PREFIX=/opt/docker/{container_name}  # 默认卷映射路径，{container_name} 会自动替换为容器名
 EOF
 docker compose up -d
+```
+
+**升级**：两行一起粘，任意目录都能跑（第一行问出 compose 在哪，第二行跳过去更新）：
+
+```bash
+D=$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' compose-tool)
+cd "$D" && docker compose pull && docker compose up -d
 ```
 
 ### 访问：`http://服务器IP:6688`
@@ -114,9 +138,8 @@ docker compose up -d
 ```bash
 cd /opt/docker/compose-tool      # 进入项目目录
 docker compose logs -f            # 查看运行日志
-docker compose pull               # 拉取最新镜像
-docker compose up -d              # 重新部署（更新后执行）
 docker compose down               # 停止并删除容器
+docker compose up -d              # 重新启动（升级命令见上文各方式）
 ```
 
 > 💡 本工具是纯静态网页，无数据持久化需求，无需挂载卷。
@@ -347,12 +370,17 @@ ports:
   - "你的端口:80"
 ```
 
-### 更新到最新版本
+### 升级 / 回滚到指定版本
+
+升级用上文【方式一】或【方式二】下面的两行命令即可。锁版本或回滚时，把 `compose.yaml` 里的标签改成目标版本再重建：
+
+```yaml
+image: ghcr.io/beacherz/compose-tool:1.0.0
+```
 
 ```bash
 cd /opt/docker/compose-tool
-docker compose pull
-docker compose up -d
+docker compose pull && docker compose up -d
 ```
 
 ---
