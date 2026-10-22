@@ -79,7 +79,7 @@ docker run -d \
   --restart unless-stopped \
   -p 6688:80 \
   -e VOLUME_PREFIX=/opt/docker/{container_name} \
-  ghcr.io/beacherz/compose-tool:latest   # 想锁版本就换成 :1.0.0
+  ghcr.io/beacherz/compose-tool:latest
 ```
 
 **升级**：先拉新镜像、删掉旧容器，再把上面那条 `docker run` 原样粘一次（纯静态页面没有数据卷，删容器不丢东西）：
@@ -89,8 +89,6 @@ docker pull ghcr.io/beacherz/compose-tool:latest
 docker rm -f compose-tool
 ```
 
-> 锁了版本号的话，把上面命令里的标签都换成目标版本（如 `1.0.1`）再执行一遍。
-
 ### 方式二：Docker Compose（推荐，符合本工具理念）
 > 💡 自定义路径说明：
 > 如果不想使用默认的 /opt/docker/ 路径，请在执行前将下面命令中所有的 /opt/docker/ 整体替换为你规划的路径（包括 mkdir、cd 以及环境变量中的路径）。
@@ -99,7 +97,7 @@ mkdir -p /opt/docker/compose-tool && cd /opt/docker/compose-tool && \
 cat > compose.yaml << 'EOF'
 services:
   compose-tool:
-    image: ghcr.io/beacherz/compose-tool:latest  # 想锁版本改成 1.0.0
+    image: ghcr.io/beacherz/compose-tool:latest
     container_name: compose-tool
     restart: unless-stopped
     ports:
@@ -364,8 +362,6 @@ ports:
 ```
 
 ### 升级 / 回滚到指定版本
-
-升级用上文【方式一】或【方式二】下面的两行命令即可。锁版本或回滚时，把 `compose.yaml` 里的标签改成目标版本再重建：
 
 ```yaml
 image: ghcr.io/beacherz/compose-tool:1.0.0

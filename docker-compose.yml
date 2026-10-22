@@ -1,6 +1,6 @@
 services:
   compose-tool:
-    image: ghcr.io/beacherz/compose-tool:latest  # 想锁版本改成 1.0.0
+    image: ghcr.io/beacherz/compose-tool:latest
     container_name: compose-tool
     restart: unless-stopped
     ports:
