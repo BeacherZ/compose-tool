@@ -196,6 +196,8 @@
         function preprocessInput(raw) {
             var heredocMatch = raw.match(/<<\s*['"]?EOF['"]?\n([\s\S]*?)\nEOF/i);
             if (heredocMatch) return heredocMatch[1].trim();
+            // Compose YAML：原样保留，注释和缩进都是有效内容，不能走脚本清洗
+            if (/\bservices\s*:/.test(raw)) return raw;
             if(/docker\s+run\b/.test(raw)) return raw;
             var boilerplate = [/^\s*mkdir\b/, /^\s*cd\b/, /^\s*cat\b/, /^\s*tee\b/, /^\s*vim?\b/, /^\s*nano\b/, /^\s*echo\b/, /^\s*docker\s+compose\b/, /^\s*docker-compose\b/, /^\s*docker\s+pull\b/, /^\s*docker\s+stop\b/, /^\s*docker\s+rm\b/, /^\s*docker\s+start\b/, /^\s*docker\s+restart\b/, /^\s*sudo\b/, /^\s*#/, /^\s*EOF\s*$/, /^\s*\\\s*$/];
             var lines = raw.split('\n');
@@ -207,18 +209,59 @@
             return clean.join('\n').trim();
         }
 
+        // 引号感知分词：保留原始引号，取值时统一用 unquote()
         function tokenize(str) {
-            var tokens = [], current = '', inD = false, inS = false;
+            var tokens = [], current = '', inD = false, inS = false, hasToken = false;
             for (var idx = 0; idx < str.length; idx++) {
                 var c = str[idx];
-                if (c === '"' && !inS) inD = !inD;
-                else if (c === "'" && !inD) inS = !inS;
-                else if (/\s/.test(c) && !inD && !inS) { if (current) { tokens.push(current); current = ''; } }
-                else current += c;
+                if (c === '"' && !inS) { inD = !inD; current += c; hasToken = true; }
+                else if (c === "'" && !inD) { inS = !inS; current += c; hasToken = true; }
+                else if (/\s/.test(c) && !inD && !inS) { if (hasToken) { tokens.push(current); current = ''; hasToken = false; } }
+                else { current += c; hasToken = true; }
             }
-            if (current) tokens.push(current);
+            if (hasToken) tokens.push(current);
             return tokens;
         }
+
+        function unquote(str) {
+            if (str === undefined || str === null) return '';
+            str = String(str).trim();
+            if (str.length >= 2) {
+                var q = str.charAt(0);
+                if ((q === '"' || q === "'") && str.charAt(str.length - 1) === q) return str.slice(1, -1);
+            }
+            return str;
+        }
+
+        // 按 shell 语义求值：去掉任何位置的引号，处理反斜杠转义（用于 -e FOO="bar" 这类写法）
+        function shellUnquote(str) {
+            if (str === undefined || str === null) return '';
+            str = String(str);
+            var out = '', inD = false, inS = false;
+            for (var k = 0; k < str.length; k++) {
+                var c = str.charAt(k);
+                if (c === '\\' && !inS && k + 1 < str.length) {
+                    var nx = str.charAt(k + 1);
+                    if (inD && nx !== '"' && nx !== '\\' && nx !== '$' && nx !== '`') { out += c; continue; }
+                    out += nx; k++; continue;
+                }
+                if (c === '"' && !inS) { inD = !inD; continue; }
+                if (c === "'" && !inD) { inS = !inS; continue; }
+                out += c;
+            }
+            return out.trim();
+        }
+
+        function yamlQuote(val) {
+            return '"' + String(val).replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"';
+        }
+
+        // 安全字符直接输出，其余加引号，保持与旧版输出一致的观感
+        function yamlScalar(val) {
+            return /^[A-Za-z0-9._\/-]+$/.test(String(val)) ? String(val) : yamlQuote(val);
+        }
+
+        function indentOf(line) { return line.match(/^(\s*)/)[1].length; }
 
         function extractRunCommand(rawInput) {
             var joined = rawInput.replace(/\\\s*\n/g, ' ');
@@ -226,9 +269,9 @@
             var runCommand = null, runStartIdx = -1, pullImage = null;
             for (var idx = 0; idx < lines.length; idx++) {
                 var line = lines[idx];
-                if (line.startsWith('docker run')) { runCommand = line; runStartIdx = idx; }
-                else if (line.startsWith('docker pull')) {
-                    var parts = line.split(/\s+/);
+                if (/^(?:sudo\s+)?docker\s+run\b/.test(line)) { runCommand = line; runStartIdx = idx; }
+                else if (/^(?:sudo\s+)?docker\s+pull\b/.test(line)) {
+                    var parts = line.replace(/^sudo\s+/, '').split(/\s+/);
                     var nonOpt = parts.slice(2).filter(function (p) { return !p.startsWith('-'); });
                     if (nonOpt.length > 0) pullImage = nonOpt[nonOpt.length - 1];
                 }
@@ -261,94 +304,226 @@
             return false;
         }
 
+        // 纯名称（不含 / 且不以 . ~ / 开头）= Docker 命名卷，不是宿主路径
+        function isPlainName(name) { return /^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(name); }
+
+        function normalizeHost(hostPart) {
+            if (hostPart === '.' || hostPart === '~' || hostPart === '/' || hostPart === '') return '';
+            if (hostPart.indexOf('./') === 0) return hostPart.slice(1);
+            if (hostPart.indexOf('~/') === 0) return hostPart.slice(1);
+            if (hostPart.indexOf('../') === 0) return '/' + hostPart.replace(/^(\.\.\/)+/, '');
+            if (hostPart.charAt(0) === '/') {
+                var segs = hostPart.replace(/\/+$/, '').split('/').filter(Boolean);
+                if (!segs.length) return '';
+                return '/' + segs[segs.length - 1];
+            }
+            return '/' + hostPart;
+        }
+
+        // 把 $PWD / $(pwd) / ${PWD} / $HOME / ~ 前缀视为当前目录，避免后续被当成绝对路径压扁
+        function stripCwdPrefix(p) {
+            return p.replace(/^(?:\$\(\s*pwd\s*\)|\$\{\s*PWD\s*\}|\$PWD|\$\{\s*HOME\s*\}|\$HOME|~)(?=\/|$)/, '.');
+        }
+
+        // 只处理"真实宿主路径"：系统路径、命名卷、空值原样返回
+        function resolveHostPath(rawHost, prefix) {
+            var host = stripCwdPrefix(String(rawHost).trim());
+            host = cleanShellVars(host).trim();
+            if (!host) return '';
+            if (host === '.' || host === './') return prefix ? prefix.replace(/\/+$/, '') : '.';
+            if (isSystemPath(host)) return host;
+            if (isPlainName(host)) return host;
+            if (!prefix) return host;
+            var norm = normalizeHost(host);
+            if (!norm) return host;
+            return (prefix.replace(/\/+$/, '') + norm).replace(/\/{2,}/g, '/');
+        }
+
         function resolveVolume(volRaw, prefix) {
-            volRaw = cleanShellVars(volRaw);
-            if (!prefix) {
-                var ci = volRaw.indexOf(':');
-                if (ci ===0) volRaw = '.' + volRaw;
-                if (ci === -1 && !volRaw) return '.';
-                return volRaw;
-            }
-            var ci = volRaw.indexOf(':');
-            if (ci === -1) return prefix + '/' + volRaw;
-            var hostPart = volRaw.slice(0, ci);
-            var containerPart = volRaw.slice(ci);
-            if (isSystemPath(hostPart)) return volRaw;
-            if (hostPart === '.' || hostPart === '~' || hostPart === '/' || hostPart === '') {
-                hostPart = '';
-            } else if (hostPart.startsWith('./')) {
-                hostPart = hostPart.slice(1);
-            } else if (hostPart.startsWith('~/')) {
-                hostPart = hostPart.slice(1);
-            } else if (hostPart.startsWith('../')) {
-                hostPart = '/' + hostPart.replace(/^(\.\.\/)+/, '');
-            } else if (hostPart.startsWith('/')) {
-                var absSegs = hostPart.replace(/\/+$/, '').split('/').filter(Boolean);
-                if (absSegs.length === 0) return volRaw;
-                hostPart = '/' + absSegs[absSegs.length - 1];
+            var vol = String(volRaw).trim();
+            if (!vol) return vol;
+            var ci = vol.indexOf(':');
+            if (ci < 0) return cleanShellVars(vol);       // 只有容器内路径（匿名卷）：原样保留
+            var host = vol.slice(0, ci);
+            var rest = vol.slice(ci);
+            if (!host) return vol;                        // 形如 ":data" 的非法写法，不动
+            var resolved = resolveHostPath(host, prefix);
+            if (!resolved) return prefix ? prefix.replace(/\/+$/, '') + rest : cleanShellVars(vol);
+            return resolved + rest;
+        }
+
+        // 解析 volumes 列表项：区分短语法（host:container）、长语法（type/source 映射）
+        function parseVolumeItem(body) {
+            var q = '', value = body, tail = '';
+            if (body.charAt(0) === '"' || body.charAt(0) === "'") {
+                q = body.charAt(0);
+                var end = body.indexOf(q, 1);
+                if (end < 0) return { long: false, value: '' };
+                value = body.slice(1, end);
+                tail = body.slice(end + 1);
             } else {
-                hostPart = '/' + hostPart;
+                var hash = body.search(/\s#/);
+                if (hash >= 0) { tail = body.slice(hash); value = body.slice(0, hash); }
+                value = value.trim();
+                // "type: bind" / "source: ./data" 之类是 YAML 映射，不是短语法路径
+                if (/^[A-Za-z_][\w.-]*\s*:\s+\S/.test(value)) return { long: true };
             }
-            return (prefix.replace(/\/+$/, '') + hostPart + containerPart).replace(/\/+/g, '/');
+            return { long: false, value: value.trim(), quote: q, tail: tail };
         }
 
         function processComposeYaml(yamlStr) {
             var rp = volumePrefixEl.value.trim();
             var lines = yamlStr.split('\n');
+            var inserts = {};
+            function addInsert(idx, arr) {
+                if (!arr.length) return;
+                inserts[idx] = (inserts[idx] || []).concat(arr);
+            }
+
+            // ---------- 1. 定位 services: 块，切出每个 service 的边界 ----------
+            var servicesIdx = -1, servicesIndent = 0;
+            for (var i = 0; i < lines.length; i++) {
+                if (/^\s*services:\s*(#.*)?$/.test(lines[i])) {
+                    servicesIdx = i; servicesIndent = indentOf(lines[i]); break;
+                }
+            }
+            var services = [];
+            if (servicesIdx >= 0) {
+                var blockEnd = lines.length;
+                for (var i = servicesIdx + 1; i < lines.length; i++) {
+                    if (!lines[i].trim() || /^\s*#/.test(lines[i])) continue;
+                    if (indentOf(lines[i]) <= servicesIndent) { blockEnd = i; break; }
+                }
+                var keyIndent = -1;
+                for (var i = servicesIdx + 1; i < blockEnd; i++) {
+                    var line = lines[i];
+                    if (!line.trim() || /^\s*#/.test(line)) continue;
+                    var ind = indentOf(line);
+                    if (keyIndent === -1) keyIndent = ind;
+                    if (ind !== keyIndent) continue;
+                    var km = line.match(/^\s*([^\s:#][^:#]*?)\s*:\s*(#.*)?$/);
+                    if (km) services.push({
+                        name: unquote(km[1]), start: i, end: blockEnd, indent: ind,
+                        childIndent: -1, containerName: '', hasRestart: false, hasPrivileged: false
+                    });
+                }
+                for (var k = 0; k < services.length; k++) {
+                    if (k + 1 < services.length) services[k].end = services[k + 1].start;
+                }
+            }
+
+            // ---------- 2. 每个 service 先取自身元信息 ----------
+            for (var s = 0; s < services.length; s++) {
+                var svc = services[s];
+                for (var i = svc.start + 1; i < svc.end; i++) {
+                    var line = lines[i];
+                    if (!line.trim() || /^\s*#/.test(line)) continue;
+                    if (svc.childIndent === -1) svc.childIndent = indentOf(line);
+                    var cm = line.match(/^\s*container_name:\s*(.+?)\s*(#.*)?$/);
+                    if (cm) svc.containerName = unquote(cm[1]);
+                    if (/^\s*restart:\s*\S/.test(line)) svc.hasRestart = true;
+                    if (/^\s*privileged:\s*\S/.test(line)) svc.hasPrivileged = true;
+                }
+            }
+
+            // ---------- 3. 按 service 自己的目录前缀改写卷 ----------
+            var referencedNamed = [];
+            for (var s = 0; s < services.length; s++) {
+                var svc = services[s];
+                var prefix = rp ? rp.replace(/\{container_name\}/g, svc.containerName || svc.name) : '';
+                var volIndent = -1, longIndent = -1;
+                for (var i = svc.start + 1; i < svc.end; i++) {
+                    var line = lines[i];
+                    if (!line.trim()) continue;
+                    var ind = indentOf(line);
+                    if (volIndent >= 0 && ind <= volIndent) { volIndent = -1; longIndent = -1; }
+                    if (/^\s*volumes:\s*(#.*)?$/.test(line)) { volIndent = ind; longIndent = -1; continue; }
+                    if (volIndent < 0) continue;
+
+                    var itemMatch = line.match(/^(\s*)-(\s+|$)/);
+                    if (itemMatch) {
+                        var parsed = parseVolumeItem(line.slice(itemMatch[0].length));
+                        if (parsed.long) { longIndent = ind; continue; }
+                        longIndent = -1;
+                        if (!parsed.value) continue;
+                        var host0 = parsed.value.split(':')[0];
+                        if (host0 && isPlainName(host0)) referencedNamed.push(host0);
+                        var resolved = resolveVolume(parsed.value, prefix);
+                        lines[i] = itemMatch[1] + '- ' + parsed.quote + resolved + parsed.quote + parsed.tail;
+                        continue;
+                    }
+                    if (longIndent >= 0 && ind > longIndent) {
+                        var sm = line.match(/^(\s*)(source|device):\s*(.+?)\s*(#.*)?$/);
+                        if (sm) {
+                            var vq = (sm[3].charAt(0) === '"' || sm[3].charAt(0) === "'") ? sm[3].charAt(0) : '';
+                            var rv = resolveHostPath(unquote(sm[3]), prefix);
+                            if (isPlainName(rv)) referencedNamed.push(rv);
+                            lines[i] = sm[1] + sm[2] + ': ' + (vq ? vq + rv + vq : rv) + (sm[4] ? ' ' + sm[4] : '');
+                        }
+                    }
+                }
+            }
+
+            // ---------- 4. restart / privileged 补到各自 service 块末尾 ----------
+            for (var s = 0; s < services.length; s++) {
+                var svc = services[s];
+                var childIndent = svc.childIndent === -1 ? svc.indent + 2 : svc.childIndent;
+                var pad = new Array(childIndent + 1).join(' ');
+                var add = [];
+                if (!svc.hasRestart && cbRestart.checked) add.push(pad + 'restart: unless-stopped');
+                if (!svc.hasPrivileged && cbPrivileged.checked) add.push(pad + 'privileged: true');
+                if (!add.length) continue;
+                var insertAt = svc.end;
+                while (insertAt > svc.start + 1 && (!lines[insertAt - 1].trim() || /^\s*#/.test(lines[insertAt - 1]))) insertAt--;
+                addInsert(insertAt, add);
+            }
+
+            // ---------- 5. 引用了命名卷但未声明时补声明，避免 compose 报 undefined volume ----------
+            var declared = {}, topVolIdx = -1, topVolIndent = 0, declIndent = -1;
+            for (var i = 0; i < lines.length; i++) {
+                if (indentOf(lines[i]) <= servicesIndent && /^\s*volumes:\s*(#.*)?$/.test(lines[i])) {
+                    topVolIdx = i; topVolIndent = indentOf(lines[i]); break;
+                }
+            }
+            if (topVolIdx >= 0) {
+                for (var i = topVolIdx + 1; i < lines.length; i++) {
+                    if (!lines[i].trim() || /^\s*#/.test(lines[i])) continue;
+                    var ind = indentOf(lines[i]);
+                    if (ind <= topVolIndent) break;
+                    if (declIndent === -1) declIndent = ind;
+                    if (ind !== declIndent) continue;
+                    var dm = lines[i].match(/^\s*([^\s:#][^:#]*?)\s*:/);
+                    if (dm) declared[unquote(dm[1])] = true;
+                }
+            }
+            var missing = [];
+            for (var n = 0; n < referencedNamed.length; n++) {
+                if (!declared[referencedNamed[n]] && missing.indexOf(referencedNamed[n]) < 0) missing.push(referencedNamed[n]);
+            }
+            if (missing.length) {
+                var vpad = new Array(topVolIndent + 3).join(' ');
+                var declLines = missing.map(function (vn) { return vpad + vn + ':'; });
+                if (topVolIdx >= 0) {
+                    var at = lines.length;
+                    while (at > topVolIdx + 1 && (!lines[at - 1].trim() || /^\s*#/.test(lines[at - 1]))) at--;
+                    addInsert(at, declLines);
+                } else {
+                    addInsert(lines.length, [''].concat(['volumes:'].concat(declLines)));
+                }
+            }
+
+            // ---------- 6. 合并插入内容 ----------
             var result = [];
-            var inServiceVolumes = false;
-            var serviceIndent = -1;
-            var containerName = '';
-            var serviceName = '';
-            var hasRestart = false;
-            var hasPrivileged = false;
-
-            for (var i = 0; i < lines.length; i++) {
-                var m = lines[i].match(/^\s*container_name:\s*(.+)/);
-                if (m) containerName = m[1].trim();
-                if (lines[i].match(/^\s*restart:\s*/)) hasRestart = true;
-                if (lines[i].match(/^\s*privileged:\s*/)) hasPrivileged = true;
-                if (!serviceName && i > 0) {
-                    if (lines[i-1].match(/^services:\s*$/)) {
-                        var sn = lines[i].match(/^  ([a-zA-Z0-9_-]+):\s*$/);
-                        if (sn) serviceName = sn[1];
-                    }
-                }
+            for (var i = 0; i <= lines.length; i++) {
+                if (inserts[i]) result = result.concat(inserts[i]);
+                if (i < lines.length) result.push(lines[i]);
             }
-
-            var effectiveName = containerName || serviceName || 'my-service';
-            var finalPrefix = rp ? rp.replace(/\{container_name\}/g, effectiveName) : '';
-
-            for (var i = 0; i < lines.length; i++) {
-                var line = lines[i];
-                var lineIndent = line.match(/^(\s*)/)[1].length;
-                if (line.match(/^\s+volumes:\s*$/) && lineIndent >= 4) { inServiceVolumes = true; serviceIndent = lineIndent; result.push(line); continue; }
-                if (line.match(/^volumes:\s*$/)) { inServiceVolumes = false; result.push(line); continue; }
-                if (inServiceVolumes) {
-                    var isListItem = line.match(/^\s*-\s+/);
-                    if (!isListItem && line.trim() !== '') {
-                        var currentIndent = line.match(/^(\s*)/)[1].length;
-                        if (currentIndent <= serviceIndent) inServiceVolumes = false;
-                    }
-                }
-                if (inServiceVolumes && line.match(/^\s*-\s+/)) {
-                    var volMatch = line.match(/^\s*-\s+"?([^"]+)"?\s*$/);
-                    if (volMatch) { var vol = volMatch[1]; var resolved = resolveVolume(vol, finalPrefix); line = line.replace(vol, resolved); }
-                }
-                result.push(line);
-            }
-            var insertIdx = result.length;
-            for (var i = result.length - 1; i >= 0; i--) { if (result[i].trim() !== '') { insertIdx = i + 1; break; } }
-            var indent = '    ';
-            for (var i = 0; i < result.length; i++) {
-                var im = result[i].match(/^(\s+)(image|container_name|restart|ports|volumes|environment):/);
-                if (im) { indent = im[1]; break; }
-            }
-            if (!hasRestart && cbRestart.checked) { result.splice(insertIdx, 0, indent + 'restart: unless-stopped'); insertIdx++; }
-            if (!hasPrivileged && cbPrivileged.checked) { result.splice(insertIdx, 0, indent + 'privileged: true'); }
             var yaml = result.join('\n');
-            var deployContainerName = effectiveName;
-            var deployDir = finalPrefix ? finalPrefix : '/opt/docker/' + deployContainerName;
+
+            var primaryName = services.length
+                ? (services[0].containerName || services[0].name)
+                : 'my-service';
+            var deployDir = rp ? rp.replace(/\{container_name\}/g, primaryName) : '/opt/docker/' + primaryName;
             var deployCommand =
 "mkdir -p " + deployDir + " && cd " + deployDir + " && \\\n" +
 "cat > compose.yaml << 'EOF'\n" + yaml + "\nEOF\n" +
@@ -380,11 +555,15 @@
         }
 
         function parseDockerCommand(command, pullImage) {
-            var args = command.replace(/^docker run\s*/, '');
+            var args = command.replace(/^\s*(?:sudo\s+)+/, '').replace(/^docker\s+run\s*/, '');
             var tokens = tokenize(args);
             var BUILTIN = { host: 1, bridge: 1, none: 1 };
             var BOOLS = { '--rm':1, '--init':1, '--tty':1, '-t':1, '-i':1, '-it':1, '--no-healthcheck':1, '--oom-kill-disable':1, '--read-only':1, '--sig-proxy':1 };
+            // 组合短选项：-dit / -itd / -ti 之类（等价于 -d -i -t）
+            var SHORT_BOOLS = /^-[dit]+$/;
             var svc = { image: '', container_name: '', hostname: '', working_dir: '', ports: [], volumes: [], environment: [], networks: [], labels: [], logging: { driver: '', options: {} }, restart: '', privileged: false, command: '' };
+            // 取值：--opt=value 或 --opt value，按 shell 语义去掉引号
+            function valOf(idx, inline) { return shellUnquote(inline !== null ? inline : tokens[idx + 1]); }
             var restCLI = false, privCLI = false;
             var topVol = {}, topNet = {};
             var i = 0;
@@ -394,20 +573,24 @@
                 var o = t, ve = null;
                 if (t.startsWith('-') && t.includes('=')) { var eq = t.indexOf('='); o = t.slice(0, eq); ve = t.slice(eq + 1); }
                 if (o === '-d' || o === '--detach') { i++; continue; }
-                if (BOOLS[o]) { i++; continue; }
-                if (o === '--name') { svc.container_name = ve !== null ? ve : tokens[i+1]; i += ve !== null ? 1 : 2; continue; }
-                if (o === '--hostname' || o === '-h') { svc.hostname = ve !== null ? ve : tokens[i+1]; i += ve !== null ? 1 : 2; continue; }
-                if (o === '-p' || o === '--publish') { svc.ports.push(ve !== null ? ve : tokens[i+1]); i += ve !== null ? 1 : 2; continue; }
-                if (o === '--workdir' || o === '-w') { svc.working_dir = ve !== null ? ve : tokens[i+1]; i += ve !== null ? 1 : 2; continue; }
-                if (o === '-v' || o === '--volume') { svc.volumes.push(ve !== null ? ve : tokens[i+1]); i += ve !== null ? 1 : 2; continue; }
-                if (o === '-e' || o === '--env') { svc.environment.push(ve !== null ? ve : tokens[i+1]); i += ve !== null ? 1 : 2; continue; }
-                if (o === '--restart') { svc.restart = ve !== null ? ve : tokens[i+1]; restCLI = true; i += ve !== null ? 1 : 2; continue; }
+                if (BOOLS[o] || SHORT_BOOLS.test(o)) { i++; continue; }
+                if (o === '--name') { svc.container_name = valOf(i, ve); i += ve !== null ? 1 : 2; continue; }
+                if (o === '--hostname' || o === '-h') { svc.hostname = valOf(i, ve); i += ve !== null ? 1 : 2; continue; }
+                if (o === '-p' || o === '--publish') { svc.ports.push(valOf(i, ve)); i += ve !== null ? 1 : 2; continue; }
+                if (o === '--workdir' || o === '-w') { svc.working_dir = valOf(i, ve); i += ve !== null ? 1 : 2; continue; }
+                if (o === '-v' || o === '--volume') { svc.volumes.push(valOf(i, ve)); i += ve !== null ? 1 : 2; continue; }
+                if (o === '-e' || o === '--env') { svc.environment.push(valOf(i, ve)); i += ve !== null ? 1 : 2; continue; }
+                if (o === '--restart') { svc.restart = valOf(i, ve); restCLI = true; i += ve !== null ? 1 : 2; continue; }
                 if (o === '--privileged') { svc.privileged = true; privCLI = true; i++; continue; }
-                if (o === '--label' || o === '-l') { svc.labels.push(ve !== null ? ve : tokens[i+1]); i += ve !== null ? 1 : 2; continue; }
-                if (o === '--log-driver') { svc.logging.driver = ve !== null ? ve : tokens[i+1]; i += ve !== null ? 1 : 2; continue; }
-                if (o === '--log-opt') { var r = ve !== null ? ve : tokens[i+1]; var ep = r.indexOf('='); var k = ep >= 0 ? r.slice(0, ep) : r; var v = ep >= 0 ? r.slice(ep + 1) : ''; if (k) svc.logging.options[k] = v; i += ve !== null ? 1 : 2; continue; }
-                if (o === '--network' || o === '--net') { var n = ve !== null ? ve : tokens[i+1]; svc.networks.push(n); if (!BUILTIN[n] && !topNet[n]) topNet[n] = { external: true }; i += ve !== null ? 1 : 2; continue; }
-                if (!t.startsWith('-')) { if (!svc.image) svc.image = t; else { var cmd = tokens.slice(i).join(' '); if (cmd) svc.command = '"' + cmd + '"'; break; } i++; continue; }
+                if (o === '--label' || o === '-l') { svc.labels.push(valOf(i, ve)); i += ve !== null ? 1 : 2; continue; }
+                if (o === '--log-driver') { svc.logging.driver = valOf(i, ve); i += ve !== null ? 1 : 2; continue; }
+                if (o === '--log-opt') { var r = valOf(i, ve); var ep = r.indexOf('='); var k = ep >= 0 ? r.slice(0, ep) : r; var v = ep >= 0 ? r.slice(ep + 1) : ''; if (k) svc.logging.options[k] = v; i += ve !== null ? 1 : 2; continue; }
+                if (o === '--network' || o === '--net') { var n = valOf(i, ve); svc.networks.push(n); if (!BUILTIN[n] && !topNet[n]) topNet[n] = { external: true }; i += ve !== null ? 1 : 2; continue; }
+                if (!t.startsWith('-')) {
+                    if (!svc.image) svc.image = shellUnquote(t);
+                    else { var cmd = tokens.slice(i).join(' '); if (cmd) svc.command = yamlQuote(cmd); break; }
+                    i++; continue;
+                }
                 if (o.startsWith('-')) { i += ve !== null ? 1 : 2; continue; }
                 i++;
             }
@@ -422,25 +605,26 @@
             if (!restCLI) svc.restart = cbRestart.checked ? 'unless-stopped' : '';
             if (!privCLI) svc.privileged = cbPrivileged.checked;
             var rv = svc.volumes.map(function (vol) {
-                var res = resolveVolume(vol, vp);
-                if (!vp) { var cleaned = cleanShellVars(vol); var hp = cleaned.includes(':') ? cleaned.split(':')[0] : cleaned; if (hp && /^[a-zA-Z0-9_-]+$/.test(hp)) { if (!topVol[hp]) topVol[hp] = {}; } }
-                return res;
+                var cleaned = cleanShellVars(vol);
+                var hp = cleaned.indexOf(':') >= 0 ? cleaned.split(':')[0] : '';
+                if (hp && isPlainName(hp) && !topVol[hp]) topVol[hp] = {};   // 命名卷需在顶层声明
+                return resolveVolume(vol, vp);
             });
             var y = "services:\n  " + finalName + ":\n    image: " + svc.image + "\n";
-            if (svc.container_name) y += "    container_name: " + svc.container_name + "\n";
-            if (svc.hostname) y += "    hostname: " + svc.hostname + "\n";
-            if (svc.working_dir) y += "    working_dir: " + svc.working_dir + "\n";
-            if (svc.ports.length) { y += "    ports:\n"; svc.ports.forEach(function (p) { y += '      - "' + p + '"\n'; }); }
-            if (rv.length) { y += "    volumes:\n"; rv.forEach(function (v) { y += '      - "' + v + '"\n'; }); }
-            if (svc.environment.length) { y += "    environment:\n"; svc.environment.forEach(function (e) { y += '      - "' + e + '"\n'; }); }
-            if (svc.labels.length) { y += "    labels:\n"; svc.labels.forEach(function (l) { y += '      - "' + l + '"\n'; }); }
+            if (svc.container_name) y += "    container_name: " + yamlScalar(svc.container_name) + "\n";
+            if (svc.hostname) y += "    hostname: " + yamlScalar(svc.hostname) + "\n";
+            if (svc.working_dir) y += "    working_dir: " + yamlScalar(svc.working_dir) + "\n";
+            if (svc.ports.length) { y += "    ports:\n"; svc.ports.forEach(function (p) { y += '      - ' + yamlQuote(p) + '\n'; }); }
+            if (rv.length) { y += "    volumes:\n"; rv.forEach(function (v) { y += '      - ' + yamlQuote(v) + '\n'; }); }
+            if (svc.environment.length) { y += "    environment:\n"; svc.environment.forEach(function (e) { y += '      - ' + yamlQuote(e) + '\n'; }); }
+            if (svc.labels.length) { y += "    labels:\n"; svc.labels.forEach(function (l) { y += '      - ' + yamlQuote(l) + '\n'; }); }
             var hd = !!svc.logging.driver, ho = Object.keys(svc.logging.options).length > 0;
-            if (hd || ho) { y += "    logging:\n"; if (hd) y += "      driver: " + svc.logging.driver + "\n"; if (ho) { y += "      options:\n"; for (var lk in svc.logging.options) y += '        ' + lk + ': "' + svc.logging.options[lk] + '"\n'; } }
+            if (hd || ho) { y += "    logging:\n"; if (hd) y += "      driver: " + svc.logging.driver + "\n"; if (ho) { y += "      options:\n"; for (var lk in svc.logging.options) y += '        ' + lk + ': ' + yamlQuote(svc.logging.options[lk]) + '\n'; } }
             if (svc.networks.length) { y += "    networks:\n"; svc.networks.forEach(function (nn) { y += "      - " + nn + "\n"; }); }
             if (svc.restart) y += "    restart: " + svc.restart + "\n";
             if (svc.privileged) y += "    privileged: true\n";
             if (svc.command) y += "    command: " + svc.command + "\n";
-            if (!vp && Object.keys(topVol).length) { y += "\nvolumes:\n"; for (var vn in topVol) y += "  " + vn + ":\n"; }
+            if (Object.keys(topVol).length) { y += "\nvolumes:\n"; for (var vn in topVol) y += "  " + vn + ":\n"; }
             if (Object.keys(topNet).length) { y += "\nnetworks:\n"; for (var nn in topNet) { y += "  " + nn + ":\n"; if (topNet[nn].external) y += "    external: true\n"; } }
             var deployDir = vp ? vp : '/opt/docker/' + finalName;
             var deployCommand =
